@@ -14,6 +14,35 @@ from utils.augmentation import run_augmentation, run_augmentation_single
 
 warnings.filterwarnings('ignore')
 
+class VAELoss(nn.Module):
+    """
+    Combined loss for VAE-based time series model.
+    Computes a weighted sum of Mean Squared Error (MSE) for forecasting and
+    the KL Divergence for regularizing the latent space.
+    """
+    def __init__(self, beta=1.0):
+        super(VAELoss, self).__init__()
+        self.beta = beta
+        self.mse_criterion = nn.MSELoss()
+
+    def forward(self, model_output, target):
+        """
+        model_output: A dictionary from the model {'prediction': ..., 'mu': ..., 'log_var': ...}
+        target: The ground truth tensor (batch_y)
+        """
+        # 1. Forecasting Loss (MSE)
+        L_forecast = self.mse_criterion(model_output['prediction'], target)
+
+        # 2. KL Divergence Loss
+        mu = model_output['mu']
+        log_var = model_output['log_var']
+        L_kl = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+        L_kl /= mu.shape[0]  # Normalize by batch size
+
+        # Total Loss for backpropagation
+        total_loss = L_forecast + self.beta * L_kl
+
+        return total_loss, L_forecast, L_kl
 
 class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
@@ -35,9 +64,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return model_optim
 
     def _select_criterion(self):
-        criterion = nn.MSELoss()
+        criterion = VAELoss(beta=0.01)
         return criterion
- 
+
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
@@ -56,19 +85,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs_dict = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs_dict = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-                pred = outputs.detach()
-                true = batch_y.detach()
-
-                loss = criterion(pred, true)
-
-                total_loss.append(loss.item())
+                _, l_f, _ = criterion(outputs_dict, batch_y)
+                total_loss.append(l_f.item())
         total_loss = np.average(total_loss)
         self.model.train()
         return total_loss
@@ -96,6 +120,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
+            train_forecast_loss = []
+            train_kl_loss = []
 
             self.model.train()
             epoch_time = time.time()
@@ -114,24 +140,21 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-                        f_dim = -1 if self.args.features == 'MS' else 0
-                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                        loss = criterion(outputs, batch_y)
-                        train_loss.append(loss.item())
+                        outputs_dict = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        batch_y_processed = batch_y[:, -self.args.pred_len:, :].to(self.device)
+                        loss, l_f, l_kl = criterion(outputs_dict, batch_y_processed)
                 else:
-                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs_dict = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    batch_y_processed = batch_y[:, -self.args.pred_len:, :].to(self.device)
+                    loss, l_f, l_kl = criterion(outputs_dict, batch_y_processed)
 
-                    f_dim = -1 if self.args.features == 'MS' else 0
-                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                    loss = criterion(outputs, batch_y)
-                    train_loss.append(loss.item())
+                train_loss.append(loss.item())
+                train_forecast_loss.append(l_f.item())
+                train_kl_loss.append(l_kl.item())
 
                 if (i + 1) % 100 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                    print("\titers: {0}, epoch: {1} | total_loss: {2:.7f} | forecast_loss: {3:.7f} | kl_loss: {4:.7f}".format(
+                        i + 1, epoch + 1, loss.item(), l_f.item(), l_kl.item()))
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
                     print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
@@ -148,11 +171,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
+            train_forecast_loss = np.average(train_forecast_loss)
+            train_kl_loss = np.average(train_kl_loss)
+
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
 
-            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
-                epoch + 1, train_steps, train_loss, vali_loss, test_loss))
+            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} (F_loss:{3:.7f}, KL_loss:{4:.7f}) | Vali Loss: {5:.7f} | Test Loss: {6:.7f}".format(
+                epoch + 1, train_steps, train_loss, train_forecast_loss, train_kl_loss, vali_loss, test_loss))
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
@@ -192,9 +218,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs_dict = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs_dict = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                outputs = outputs_dict['prediction']
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, :]
